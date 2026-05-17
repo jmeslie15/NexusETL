@@ -8,6 +8,12 @@ import sys
 import os
 from dotenv import load_dotenv
 
+if len(sys.argv) > 1:
+    TOURNAMENT_URL = sys.argv[1]
+else:
+    print("Error: No tournament URL provided. Halting script.")
+    sys.exit(1)
+
 # ==========================================
 # 1. DATABASE SETUP
 # ==========================================
@@ -22,7 +28,7 @@ DB_CONFIG = {
 }
 
 def setup_database():
-    """Connects to PostgreSQL and ensures the matches table exists with clean null constraints."""
+    """Connects to PostgreSQL and ensures the matches table exists."""
     conn = psycopg2.connect(
         dbname=DB_CONFIG["dbname"],
         user=DB_CONFIG["user"],
@@ -31,8 +37,6 @@ def setup_database():
         port=DB_CONFIG["port"]
     )
     cursor = conn.cursor()
-    
-    # Season field added explicitly to structural tracking mapping
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS matches (
         match_id BIGINT PRIMARY KEY,
@@ -40,12 +44,11 @@ def setup_database():
         region TEXT,
         stage TEXT,
         game_date DATE,
-        season TEXT,
         patch_version TEXT,
         blue_team TEXT,
         red_team TEXT,
-        blue_team_id INT, 
-        red_team_id INT,  
+        blue_team_id INT, -- Added for relational mapping
+        red_team_id INT,  -- Added for relational mapping
         winner_side TEXT,
         game_number INT,
         best_of INT,
@@ -53,14 +56,14 @@ def setup_database():
         blue_kills INT,
         red_kills INT,
         total_kills INT,
+        blue_gold INT,
+        red_gold INT,
         blue_towers INT,
         red_towers INT,
         blue_dragons INT,
         red_dragons INT,
         blue_barons INT,
         red_barons INT,
-        blue_gold INT DEFAULT NULL, -- Nullable fallback override
-        red_gold INT DEFAULT NULL,  -- Nullable fallback override
         gol_match_url TEXT
     );
     ''')
@@ -71,34 +74,21 @@ def setup_database():
 # 2. HELPER FUNCTIONS
 # ==========================================
 def parse_duration(duration_str):
-    if not duration_str: return None
+    if not duration_str: return 0
     parts = duration_str.strip().split(':')
     if len(parts) == 2:
         return int(parts[0]) * 60 + int(parts[1])
-    return None
+    return 0
 
 def extract_number(text):
-    if not text: return None
+    if not text: return 0
     match = re.search(r'\d+', text)
-    return int(match.group()) if match else None
+    return int(match.group()) if match else 0
 
 def extract_gold(text):
-    """
-    CRITICAL FIX: Robust gold parser that safely extracts strings like '61.2k', '61k',
-    or full integer forms, defaulting cleanly to None (NULL) if evaluation fails.
-    """
-    if not text: 
-        return None
-    
-    clean_text = text.strip().lower().replace(',', '')
-    match = re.search(r'(\d+(?:\.\d+)?)k', clean_text)
-    
-    if match:
-        return int(float(match.group(1)) * 1000)
-    
-    # Fallback to standard integer check if 'k' string metric is missing
-    digits = re.search(r'\d+', clean_text)
-    return int(digits.group()) if digits else None
+    if not text: return 0
+    match = re.search(r'(\d+\.\d+)k', text)
+    return int(float(match.group(1)) * 1000) if match else 0
 
 # ==========================================
 # 3. INDIVIDUAL GAME SCRAPING LOGIC
@@ -113,22 +103,24 @@ def scrape_individual_game(game_url, game_number, conn, tournament_name, best_of
         'gol_match_url': game_url,
         'game_number': game_number,
         'best_of': best_of_format,
-        'tournament': tournament_name,
-        'winner_side': None # Set default to None for structural safety
+        'tournament': tournament_name
     }
     
     try:
+        # Extract Match ID
         match_id_search = re.search(r'/stats/(\d+)/', game_url)
         data['match_id'] = int(match_id_search.group(1)) if match_id_search else None
         if not data['match_id']:
             return
 
+        # Contextual Info (Date, Stage, Season)
         date_block = soup.find('div', class_='col-12 col-sm-5 text-right')
         if date_block:
             date_text = date_block.text.strip()
             date_match = re.search(r'\d{4}-\d{2}-\d{2}', date_text)
             if date_match: 
                 data['game_date'] = date_match.group(0)
+                # DYNAMIC SEASON ASSIGNMENT
                 year = int(data['game_date'].split('-')[0])
                 if year == 2025:
                     data['season'] = 'S15'
@@ -137,6 +129,7 @@ def scrape_individual_game(game_url, game_number, conn, tournament_name, best_of
                 else:
                     data['season'] = f"S{year - 2010}"
 
+        # Region Extraction
         region_block = soup.find('div', class_='col-12 col-sm-7')
         if region_block:
             region_text = region_block.text.strip()
@@ -145,34 +138,29 @@ def scrape_individual_game(game_url, game_number, conn, tournament_name, best_of
         else:
             data['region'] = "Unknown"
 
+        # Patch Extraction
         patch_elem = soup.find(string=re.compile(r'v\d+\.\d+'))
         if patch_elem: data['patch_version'] = patch_elem.strip()
 
-        time_elem = soup.find('h1', string=re.compile(r'\d{2}:\d{2}'))
-        data['duration_seconds'] = parse_duration(time_elem.text) if time_elem else None
+        # Extract Winner and Match Duration
+        winner_tag = soup.find('h1', string=re.compile(r'WIN|LOSS'))
+        if winner_tag and "WIN" in winner_tag.text:
+            data['winner_side'] = "Blue"
+        else:
+            data['winner_side'] = "Red"
 
-        # -----------------------------------------------------------------
-        # CRITICAL REFACTOR: TEAMS, WINNER & OBJECTIVES ACCURACY LAYER
-        # -----------------------------------------------------------------
+        time_elem = soup.find('h1', string=re.compile(r'\d{2}:\d{2}'))
+        data['duration_seconds'] = parse_duration(time_elem.text) if time_elem else 0
+
+        # Teams and Objectives Data Parsing
         team_blocks = soup.find_all('div', class_='col-12 col-sm-6')
         
         if len(team_blocks) >= 2:
             blue_team_block = team_blocks[0]
             red_team_block = team_blocks[1]
             
-            # 100% ACCURATE WINNER DISCOVERY: Locate 'WIN' within specific side box domains
-            blue_text = blue_team_block.get_text()
-            red_text = red_team_block.get_text()
-            
-            if "WIN" in blue_text:
-                data['winner_side'] = "Blue"
-            elif "WIN" in red_text:
-                data['winner_side'] = "Red"
-            else:
-                data['winner_side'] = None # Leaves as NULL if the data is incomplete/broken
-
             def parse_team_stats(team_html):
-                stats = {'name': 'Unknown', 'kills': None, 'towers': None, 'dragons': None, 'barons': None, 'gold': None}
+                stats = {'name': 'Unknown', 'kills': 0, 'towers': 0, 'dragons': 0, 'barons': 0, 'gold': 0}
                 
                 a_tags = team_html.find_all('a')
                 for a in a_tags:
@@ -204,13 +192,7 @@ def scrape_individual_game(game_url, game_number, conn, tournament_name, best_of
             data['red_team'] = red_stats['name']
             data['blue_kills'] = blue_stats['kills']
             data['red_kills'] = red_stats['kills']
-            
-            # Check for non-null states before combining numerical aggregations
-            if data['blue_kills'] is not None and data['red_kills'] is not None:
-                data['total_kills'] = data['blue_kills'] + data['red_kills']
-            else:
-                data['total_kills'] = None
-
+            data['total_kills'] = data['blue_kills'] + data['red_kills']
             data['blue_towers'] = blue_stats['towers']
             data['red_towers'] = red_stats['towers']
             data['blue_dragons'] = blue_stats['dragons']
@@ -230,12 +212,13 @@ def scrape_individual_game(game_url, game_number, conn, tournament_name, best_of
 # ==========================================
 def insert_match_data(conn, data):
     cursor = conn.cursor()
+    # Team IDs are intentionally omitted here to allow the backfill function to handle them
     columns = [
         'match_id', 'tournament', 'region', 'stage', 'game_date', 'season', 'patch_version',
         'blue_team', 'red_team', 'winner_side', 'game_number', 'best_of',
         'duration_seconds', 'blue_kills', 'red_kills', 'total_kills',
-        'blue_towers', 'red_towers', 'blue_dragons', 'red_dragons', 
-        'blue_barons', 'red_barons', 'blue_gold', 'red_gold', 'gol_match_url'
+        'blue_gold', 'red_gold', 'blue_towers', 'red_towers', 'blue_dragons',
+        'red_dragons', 'blue_barons', 'red_barons', 'gol_match_url'
     ]
     
     values = tuple(data.get(col, None) for col in columns)
@@ -264,6 +247,7 @@ def get_series_links_from_tournament(tournament_url):
     
     series_links = []
     for a in soup.find_all('a', href=True):
+        # Broaden criteria to catch page-game variant series layouts
         if '/game/stats/' in a['href'] and ('page-summary' in a['href'] or 'page-game' in a['href']):
             clean_href = a['href'].replace('..', '').replace('page-game', 'page-summary')
             full_url = "https://gol.gg" + clean_href
@@ -301,6 +285,7 @@ def scrape_tournament(tournament_url, conn):
         
         unique_game_links = list(dict.fromkeys(game_links))
         
+        # Fallback for BO1s
         if not unique_game_links:
             game_id_match = re.search(r'/stats/(\d+)/', series_url)
             if game_id_match:
@@ -321,6 +306,9 @@ def scrape_tournament(tournament_url, conn):
 # 6. ID BACKFILL LOGIC
 # ==========================================
 def backfill_match_team_ids(conn):
+    """
+    Runs post-scrape to map raw text team names to their respective team_ids.
+    """
     cursor = conn.cursor()
     print("\nBackfilling team IDs for newly scraped matches...")
     
@@ -340,24 +328,31 @@ def backfill_match_team_ids(conn):
         conn.commit()
         print("Team ID backfill complete.")
     except psycopg2.Error as e:
-        print(f"Could not backfill IDs: {e}")
+        # Fails gracefully if the teams table doesn't exist yet
+        print(f"Could not backfill IDs. Ensure the 'teams' table exists and is populated. Error: {e}")
         conn.rollback()
 
 # ==========================================
 # 7. MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
+    import sys  # Imported here to handle the command-line argument
+    
+    # Enforce that a URL must be passed to the script
     if len(sys.argv) < 2:
         print("❌ Error: No tournament URL provided to matches_webscraper.py.")
         sys.exit(1)
         
-    target_url = sys.argv[1]
+    tournament_url = sys.argv[1]
+    
     db_connection = setup_database()
     
     try:
-        print(f"\nInitializing primary match scrape for: {target_url}")
-        scrape_tournament(target_url, db_connection)
+        print(f"\nInitializing primary match scrape for: {tournament_url}")
+        scrape_tournament(tournament_url, db_connection)
         print("\nTournament scraping completed successfully!")
+        
+        # Execute the relational ID mapping
         backfill_match_team_ids(db_connection)
         
     except KeyboardInterrupt:
