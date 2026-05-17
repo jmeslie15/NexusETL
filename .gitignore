@@ -22,3 +22,5 @@ prefect.db
 
 # macOS system overhead files
 .DS_Store
+
+.history/
